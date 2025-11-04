@@ -7,7 +7,7 @@ index-url = "https://pypi.yelpcorp.com/simple/"
 
 [project]
 name = "workspace-mcp"
-version = "1.5.0"
+version = "1.5.2"
 description = "Comprehensive, highly performant Google Workspace Streamable HTTP & SSE MCP Server for Calendar, Gmail, Docs, Sheets, Slides & Drive"
 readme = "README.md"
 keywords = [ "mcp", "google", "workspace", "llm", "ai", "claude", "model", "context", "protocol", "server"]
