@@ -12,12 +12,19 @@ from typing import List, Optional
 from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
+from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
 
 logger = logging.getLogger(__name__)
 
 
 class TransientNetworkError(Exception):
     """Custom exception for transient network errors after retries."""
+
+    pass
+
+
+class UserInputError(Exception):
+    """Raised for user-facing input/validation errors that shouldn't be retried."""
 
     pass
 
@@ -176,7 +183,7 @@ def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
                                         member_texts.append(shared_strings[ss_idx])
                                     else:
                                         logger.warning(
-                                            f"Invalid shared string index {ss_idx} in {member}. Max index: {len(shared_strings)-1}"
+                                            f"Invalid shared string index {ss_idx} in {member}. Max index: {len(shared_strings) - 1}"
                                         )
                                 except ValueError:
                                     logger.warning(
@@ -235,7 +242,9 @@ def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
         return None
 
 
-def handle_http_errors(tool_name: str, is_read_only: bool = False, service_type: Optional[str] = None):
+def handle_http_errors(
+    tool_name: str, is_read_only: bool = False, service_type: Optional[str] = None
+):
     """
     A decorator to handle Google API HttpErrors and transient SSL errors in a standardized way.
 
@@ -276,14 +285,23 @@ def handle_http_errors(tool_name: str, is_read_only: bool = False, service_type:
                             f"A transient SSL error occurred in '{tool_name}' after {max_retries} attempts. "
                             "This is likely a temporary network or certificate issue. Please try again shortly."
                         ) from e
+                except UserInputError as e:
+                    message = f"Input error in {tool_name}: {e}"
+                    logger.warning(message)
+                    raise e
                 except HttpError as error:
                     user_google_email = kwargs.get("user_google_email", "N/A")
                     error_details = str(error)
-                    
+
                     # Check if this is an API not enabled error
-                    if error.resp.status == 403 and "accessNotConfigured" in error_details:
-                        enablement_msg = get_api_enablement_message(error_details, service_type)
-                        
+                    if (
+                        error.resp.status == 403
+                        and "accessNotConfigured" in error_details
+                    ):
+                        enablement_msg = get_api_enablement_message(
+                            error_details, service_type
+                        )
+
                         if enablement_msg:
                             message = (
                                 f"API error in {tool_name}: {enablement_msg}\n\n"
@@ -297,15 +315,31 @@ def handle_http_errors(tool_name: str, is_read_only: bool = False, service_type:
                             )
                     elif error.resp.status in [401, 403]:
                         # Authentication/authorization errors
+                        if is_oauth21_enabled():
+                            if is_external_oauth21_provider():
+                                auth_hint = (
+                                    "LLM: Ask the user to provide a valid OAuth 2.1 "
+                                    "bearer token in the Authorization header and retry."
+                                )
+                            else:
+                                auth_hint = (
+                                    "LLM: Ask the user to authenticate via their MCP "
+                                    "client's OAuth 2.1 flow and retry."
+                                )
+                        else:
+                            auth_hint = (
+                                "LLM: Try 'start_google_auth' with the user's email "
+                                "and the appropriate service_name."
+                            )
                         message = (
                             f"API error in {tool_name}: {error}. "
                             f"You might need to re-authenticate for user '{user_google_email}'. "
-                            f"LLM: Try 'start_google_auth' with the user's email and the appropriate service_name."
+                            f"{auth_hint}"
                         )
                     else:
                         # Other HTTP errors (400 Bad Request, etc.) - don't suggest re-auth
                         message = f"API error in {tool_name}: {error}"
-                    
+
                     logger.error(f"API error in {tool_name}: {error}", exc_info=True)
                     raise Exception(message) from error
                 except TransientNetworkError:
@@ -318,6 +352,10 @@ def handle_http_errors(tool_name: str, is_read_only: bool = False, service_type:
                     message = f"An unexpected error occurred in {tool_name}: {e}"
                     logger.exception(message)
                     raise Exception(message) from e
+
+        # Propagate _required_google_scopes if present (for tool filtering)
+        if hasattr(func, "_required_google_scopes"):
+            wrapper._required_google_scopes = func._required_google_scopes
 
         return wrapper
 
