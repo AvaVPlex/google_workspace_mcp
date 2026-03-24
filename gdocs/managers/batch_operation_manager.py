@@ -13,9 +13,15 @@ from gdocs.docs_helpers import (
     create_insert_text_request,
     create_delete_range_request,
     create_format_text_request,
+    create_update_paragraph_style_request,
     create_find_replace_request,
     create_insert_table_request,
     create_insert_page_break_request,
+    create_bullet_list_request,
+    create_delete_bullet_list_request,
+    create_insert_doc_tab_request,
+    create_delete_doc_tab_request,
+    create_update_doc_tab_request,
     validate_operation,
 )
 
@@ -86,13 +92,20 @@ class BatchOperationManager:
                 "operation_summary": operation_descriptions[:5],  # First 5 operations
             }
 
-            summary = self._build_operation_summary(operation_descriptions)
+            # Extract new tab IDs from insert_doc_tab replies
+            created_tabs = self._extract_created_tabs(result)
+            if created_tabs:
+                metadata["created_tabs"] = created_tabs
 
-            return (
-                True,
-                f"Successfully executed {len(operations)} operations ({summary})",
-                metadata,
-            )
+            summary = self._build_operation_summary(operation_descriptions)
+            msg = f"Successfully executed {len(operations)} operations ({summary})"
+            if created_tabs:
+                tab_info = ", ".join(
+                    f"'{t['title']}' (tab_id: {t['tab_id']})" for t in created_tabs
+                )
+                msg += f". Created tabs: {tab_info}"
+
+            return True, msg, metadata
 
         except Exception as e:
             logger.error(f"Failed to execute batch operations: {str(e)}")
@@ -160,20 +173,26 @@ class BatchOperationManager:
         Returns:
             Tuple of (request, description)
         """
+        tab_id = op.get("tab_id")
+
         if op_type == "insert_text":
-            request = create_insert_text_request(op["index"], op["text"])
+            request = create_insert_text_request(op["index"], op["text"], tab_id)
             description = f"insert text at {op['index']}"
 
         elif op_type == "delete_text":
-            request = create_delete_range_request(op["start_index"], op["end_index"])
+            request = create_delete_range_request(
+                op["start_index"], op["end_index"], tab_id
+            )
             description = f"delete text {op['start_index']}-{op['end_index']}"
 
         elif op_type == "replace_text":
             # Replace is delete + insert (must be done in this order)
             delete_request = create_delete_range_request(
-                op["start_index"], op["end_index"]
+                op["start_index"], op["end_index"], tab_id
             )
-            insert_request = create_insert_text_request(op["start_index"], op["text"])
+            insert_request = create_insert_text_request(
+                op["start_index"], op["text"], tab_id
+            )
             # Return both requests as a list
             request = [delete_request, insert_request]
             description = f"replace text {op['start_index']}-{op['end_index']} with '{op['text'][:20]}{'...' if len(op['text']) > 20 else ''}'"
@@ -185,10 +204,13 @@ class BatchOperationManager:
                 op.get("bold"),
                 op.get("italic"),
                 op.get("underline"),
+                op.get("strikethrough"),
                 op.get("font_size"),
                 op.get("font_family"),
                 op.get("text_color"),
                 op.get("background_color"),
+                op.get("link_url"),
+                tab_id,
             )
 
             if not request:
@@ -200,10 +222,12 @@ class BatchOperationManager:
                 ("bold", "bold"),
                 ("italic", "italic"),
                 ("underline", "underline"),
+                ("strikethrough", "strikethrough"),
                 ("font_size", "font size"),
                 ("font_family", "font family"),
                 ("text_color", "text color"),
                 ("background_color", "background color"),
+                ("link_url", "link"),
             ]:
                 if op.get(param) is not None:
                     value = f"{op[param]}pt" if param == "font_size" else op[param]
@@ -211,21 +235,120 @@ class BatchOperationManager:
 
             description = f"format text {op['start_index']}-{op['end_index']} ({', '.join(format_changes)})"
 
+        elif op_type == "update_paragraph_style":
+            request = create_update_paragraph_style_request(
+                op["start_index"],
+                op["end_index"],
+                op.get("heading_level"),
+                op.get("alignment"),
+                op.get("line_spacing"),
+                op.get("indent_first_line"),
+                op.get("indent_start"),
+                op.get("indent_end"),
+                op.get("space_above"),
+                op.get("space_below"),
+                tab_id,
+                op.get("named_style_type"),
+            )
+
+            if not request:
+                raise ValueError("No paragraph style options provided")
+
+            _PT_PARAMS = {
+                "indent_first_line",
+                "indent_start",
+                "indent_end",
+                "space_above",
+                "space_below",
+            }
+            _SUFFIX = {
+                "heading_level": lambda v: f"H{v}",
+                "line_spacing": lambda v: f"{v}x",
+            }
+
+            style_changes = []
+            for param, name in [
+                ("heading_level", "heading"),
+                ("alignment", "alignment"),
+                ("line_spacing", "line spacing"),
+                ("indent_first_line", "first line indent"),
+                ("indent_start", "start indent"),
+                ("indent_end", "end indent"),
+                ("space_above", "space above"),
+                ("space_below", "space below"),
+                ("named_style_type", "named style"),
+            ]:
+                if op.get(param) is not None:
+                    raw = op[param]
+                    fmt = _SUFFIX.get(param)
+                    if fmt:
+                        value = fmt(raw)
+                    elif param in _PT_PARAMS:
+                        value = f"{raw}pt"
+                    else:
+                        value = raw
+                    style_changes.append(f"{name}: {value}")
+
+            description = f"paragraph style {op['start_index']}-{op['end_index']} ({', '.join(style_changes)})"
+
         elif op_type == "insert_table":
             request = create_insert_table_request(
-                op["index"], op["rows"], op["columns"]
+                op["index"], op["rows"], op["columns"], tab_id
             )
             description = f"insert {op['rows']}x{op['columns']} table at {op['index']}"
 
         elif op_type == "insert_page_break":
-            request = create_insert_page_break_request(op["index"])
+            request = create_insert_page_break_request(op["index"], tab_id)
             description = f"insert page break at {op['index']}"
 
         elif op_type == "find_replace":
             request = create_find_replace_request(
-                op["find_text"], op["replace_text"], op.get("match_case", False)
+                op["find_text"], op["replace_text"], op.get("match_case", False), tab_id
             )
             description = f"find/replace '{op['find_text']}' → '{op['replace_text']}'"
+
+        elif op_type == "create_bullet_list":
+            list_type = op.get("list_type", "UNORDERED")
+            if list_type not in ("UNORDERED", "ORDERED", "NONE"):
+                raise ValueError(
+                    f"Invalid list_type '{list_type}'. Must be 'UNORDERED', 'ORDERED', or 'NONE'"
+                )
+            if list_type == "NONE":
+                request = create_delete_bullet_list_request(
+                    op["start_index"], op["end_index"], tab_id
+                )
+                description = f"remove bullets {op['start_index']}-{op['end_index']}"
+            else:
+                request = create_bullet_list_request(
+                    op["start_index"],
+                    op["end_index"],
+                    list_type,
+                    op.get("nesting_level"),
+                    op.get("paragraph_start_indices"),
+                    tab_id,
+                )
+                style = "bulleted" if list_type == "UNORDERED" else "numbered"
+                description = (
+                    f"create {style} list {op['start_index']}-{op['end_index']}"
+                )
+                if op.get("nesting_level"):
+                    description += f" (nesting level {op['nesting_level']})"
+
+        elif op_type == "insert_doc_tab":
+            request = create_insert_doc_tab_request(
+                op["title"], op["index"], op.get("parent_tab_id")
+            )
+            description = f"insert tab '{op['title']}' at {op['index']}"
+            if op.get("parent_tab_id"):
+                description += f" under parent tab {op['parent_tab_id']}"
+
+        elif op_type == "delete_doc_tab":
+            request = create_delete_doc_tab_request(op["tab_id"])
+            description = f"delete tab '{op['tab_id']}'"
+
+        elif op_type == "update_doc_tab":
+            request = create_update_doc_tab_request(op["tab_id"], op["title"])
+            description = f"rename tab '{op['tab_id']}' to '{op['title']}'"
 
         else:
             supported_types = [
@@ -233,9 +356,14 @@ class BatchOperationManager:
                 "delete_text",
                 "replace_text",
                 "format_text",
+                "update_paragraph_style",
                 "insert_table",
                 "insert_page_break",
                 "find_replace",
+                "create_bullet_list",
+                "insert_doc_tab",
+                "delete_doc_tab",
+                "update_doc_tab",
             ]
             raise ValueError(
                 f"Unsupported operation type '{op_type}'. Supported: {', '.join(supported_types)}"
@@ -261,6 +389,26 @@ class BatchOperationManager:
             .batchUpdate(documentId=document_id, body={"requests": requests})
             .execute
         )
+
+    def _extract_created_tabs(self, result: dict[str, Any]) -> list[dict[str, str]]:
+        """
+        Extract tab IDs from insert_doc_tab replies in the batchUpdate response.
+
+        Args:
+            result: The batchUpdate API response
+
+        Returns:
+            List of dicts with tab_id and title for each created tab
+        """
+        created_tabs = []
+        for reply in result.get("replies", []):
+            if "createDocumentTab" in reply:
+                props = reply["createDocumentTab"].get("tabProperties", {})
+                tab_id = props.get("tabId")
+                title = props.get("title", "")
+                if tab_id:
+                    created_tabs.append({"tab_id": tab_id, "title": title})
+        return created_tabs
 
     def _build_operation_summary(self, operation_descriptions: list[str]) -> str:
         """
@@ -311,12 +459,29 @@ class BatchOperationManager:
                         "bold",
                         "italic",
                         "underline",
+                        "strikethrough",
                         "font_size",
                         "font_family",
                         "text_color",
                         "background_color",
+                        "link_url",
                     ],
                     "description": "Apply formatting to text range",
+                },
+                "update_paragraph_style": {
+                    "required": ["start_index", "end_index"],
+                    "optional": [
+                        "heading_level",
+                        "alignment",
+                        "line_spacing",
+                        "indent_first_line",
+                        "indent_start",
+                        "indent_end",
+                        "space_above",
+                        "space_below",
+                        "named_style_type",
+                    ],
+                    "description": "Apply paragraph-level styling (headings, named styles like TITLE/SUBTITLE, alignment, spacing, indentation)",
                 },
                 "insert_table": {
                     "required": ["index", "rows", "columns"],
@@ -331,6 +496,27 @@ class BatchOperationManager:
                     "optional": ["match_case"],
                     "description": "Find and replace text throughout document",
                 },
+                "create_bullet_list": {
+                    "required": ["start_index", "end_index"],
+                    "optional": [
+                        "list_type",
+                        "nesting_level",
+                        "paragraph_start_indices",
+                    ],
+                    "description": "Apply or remove native bullet/numbered list formatting (list_type: UNORDERED, ORDERED, or NONE to remove; nesting_level: 0-8)",
+                },
+                "insert_doc_tab": {
+                    "required": ["title", "index"],
+                    "description": "Insert a new document tab with given title at specified index",
+                },
+                "delete_doc_tab": {
+                    "required": ["tab_id"],
+                    "description": "Delete a document tab by its ID",
+                },
+                "update_doc_tab": {
+                    "required": ["tab_id", "title"],
+                    "description": "Rename a document tab",
+                },
             },
             "example_operations": [
                 {"type": "insert_text", "index": 1, "text": "Hello World"},
@@ -341,5 +527,12 @@ class BatchOperationManager:
                     "bold": True,
                 },
                 {"type": "insert_table", "index": 20, "rows": 2, "columns": 3},
+                {
+                    "type": "update_paragraph_style",
+                    "start_index": 1,
+                    "end_index": 20,
+                    "heading_level": 1,
+                    "alignment": "CENTER",
+                },
             ],
         }

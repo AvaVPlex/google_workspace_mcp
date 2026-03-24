@@ -1,3 +1,4 @@
+import io
 import argparse
 import logging
 import os
@@ -5,6 +6,14 @@ import socket
 import sys
 from importlib import metadata, import_module
 from dotenv import load_dotenv
+
+# Prevent any stray startup output on macOS (e.g. platform identifiers) from
+# corrupting the MCP JSON-RPC handshake on stdout. We capture anything written
+# to stdout during module-level initialisation and replay it to stderr so that
+# diagnostic information is not lost.
+_original_stdout = sys.stdout
+if sys.platform == "darwin":
+    sys.stdout = io.StringIO()
 
 # Check for CLI mode early - before loading oauth_config
 # CLI mode requires OAuth 2.0 since there's no MCP session context
@@ -91,12 +100,62 @@ def configure_safe_logging():
             handler.setFormatter(safe_formatter)
 
 
+def resolve_permissions_mode_selection(
+    permission_services: list[str], tool_tier: str | None
+) -> tuple[list[str], set[str] | None]:
+    """
+    Resolve service imports and optional tool-name filtering for --permissions mode.
+
+    When a tier is specified, both:
+    - imported services are narrowed to services with tier-matched tools
+    - registered tools are narrowed to the resolved tool names
+    """
+    if tool_tier is None:
+        return permission_services, None
+
+    tier_tools, tier_services = resolve_tools_from_tier(tool_tier, permission_services)
+    return tier_services, set(tier_tools)
+
+
+def narrow_permissions_to_services(
+    permissions: dict[str, str], services: list[str]
+) -> dict[str, str]:
+    """Restrict permission entries to the provided service list order."""
+    return {
+        service: permissions[service] for service in services if service in permissions
+    }
+
+
+def _restore_stdout() -> None:
+    """Restore the real stdout and replay any captured output to stderr."""
+    captured_stdout = sys.stdout
+
+    # Idempotent: if already restored, nothing to do.
+    if captured_stdout is _original_stdout:
+        return
+
+    captured = ""
+    required_stringio_methods = ("getvalue", "write", "flush")
+    try:
+        if all(
+            callable(getattr(captured_stdout, method_name, None))
+            for method_name in required_stringio_methods
+        ):
+            captured = captured_stdout.getvalue()
+    finally:
+        sys.stdout = _original_stdout
+
+    if captured:
+        print(captured, end="", file=sys.stderr)
+
+
 def main():
     """
     Main entry point for the Google Workspace MCP server.
     Uses FastMCP's native streamable-http transport.
     Supports CLI mode for direct tool invocation without running the server.
     """
+    _restore_stdout()
     # Check if CLI mode is enabled - suppress startup messages
     if _CLI_MODE:
         # Suppress logging output in CLI mode for clean output
@@ -155,12 +214,40 @@ def main():
         action="store_true",
         help="Run in read-only mode - requests only read-only scopes and disables tools requiring write permissions",
     )
+    parser.add_argument(
+        "--permissions",
+        nargs="+",
+        metavar="SERVICE:LEVEL",
+        help=(
+            "Granular per-service permission levels. Format: service:level. "
+            "Example: --permissions gmail:organize drive:readonly. "
+            "Gmail levels: readonly, organize, drafts, send, full (cumulative). "
+            "Other services: readonly, full. "
+            "Mutually exclusive with --read-only and --tools."
+        ),
+    )
     args = parser.parse_args()
 
     # Clean up CLI args - argparse.REMAINDER may include leading dashes from first arg
     if args.cli is not None:
         # Filter out empty strings that might appear
         args.cli = [a for a in args.cli if a]
+
+    # Validate mutually exclusive flags
+    if args.permissions and args.read_only:
+        print(
+            "Error: --permissions and --read-only are mutually exclusive. "
+            "Use service:readonly within --permissions instead.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.permissions and args.tools is not None:
+        print(
+            "Error: --permissions and --tools cannot be combined. "
+            "Select services via --permissions (optionally with --tool-tier).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Set port and base URI once for reuse throughout the function
     port = int(os.getenv("PORT", os.getenv("WORKSPACE_MCP_PORT", 8000)))
@@ -184,6 +271,8 @@ def main():
     safe_print(f"   👤 Mode: {'Single-user' if args.single_user else 'Multi-user'}")
     if args.read_only:
         safe_print("   🔒 Read-Only: Enabled")
+    if args.permissions:
+        safe_print("   🔒 Permissions: Granular mode")
     safe_print(f"   🐍 Python: {sys.version.split()[0]}")
     safe_print("")
 
@@ -265,7 +354,36 @@ def main():
     }
 
     # Determine which tools to import based on arguments
-    if args.tool_tier is not None:
+    perms = None
+    if args.permissions:
+        # Granular permissions mode — parse and activate before tool selection
+        from auth.permissions import parse_permissions_arg, set_permissions
+
+        try:
+            perms = parse_permissions_arg(args.permissions)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        # Permissions implicitly defines which services to load
+        tools_to_import = list(perms.keys())
+        set_enabled_tool_names(None)
+
+        if args.tool_tier is not None:
+            # Combine with tier filtering within the permission-selected services
+            try:
+                tools_to_import, tier_tool_filter = resolve_permissions_mode_selection(
+                    tools_to_import, args.tool_tier
+                )
+                set_enabled_tool_names(tier_tool_filter)
+                perms = narrow_permissions_to_services(perms, tools_to_import)
+            except Exception as e:
+                print(
+                    f"Error loading tools for tier '{args.tool_tier}': {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        set_permissions(perms)
+    elif args.tool_tier is not None:
         # Use tier-based tool selection, optionally filtered by services
         try:
             tier_tools, suggested_services = resolve_tools_from_tier(
@@ -314,6 +432,11 @@ def main():
         except ModuleNotFoundError as exc:
             logger.error("Failed to import tool '%s': %s", tool, exc, exc_info=True)
             safe_print(f"   ⚠️ Failed to load {tool.title()} tool module ({exc}).")
+
+    if perms:
+        safe_print("🔒 Permission Levels:")
+        for svc, lvl in sorted(perms.items()):
+            safe_print(f"   {tool_icons.get(svc, '  ')} {svc}: {lvl}")
     safe_print("")
 
     # Filter tools based on tier configuration (if tier-based loading is enabled)
@@ -427,7 +550,12 @@ def main():
                 )
                 sys.exit(1)
 
-            server.run(transport="streamable-http", host=host, port=port)
+            server.run(
+                transport="streamable-http",
+                host=host,
+                port=port,
+                stateless_http=is_stateless_mode(),
+            )
         else:
             server.run()
     except KeyboardInterrupt:
