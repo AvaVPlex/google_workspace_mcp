@@ -550,12 +550,47 @@ def main():
                 )
                 sys.exit(1)
 
-            server.run(
+            # Create a dual-transport app that serves both Streamable HTTP (/mcp)
+            # and SSE (/sse) so that all MCP clients are supported:
+            #   - Streamable HTTP: Claude Desktop, Claude Code, Manus
+            #   - SSE: Poke, mcp-remote, older clients
+            import uvicorn as _uvicorn
+            from starlette.applications import Starlette
+            from starlette.routing import Mount
+
+            streamable_app = server.http_app(
                 transport="streamable-http",
-                host=host,
-                port=port,
                 stateless_http=is_stateless_mode(),
             )
+            sse_app = server.http_app(
+                transport="sse",
+            )
+
+            # Merge routes: SSE app routes + Streamable HTTP app routes
+            # SSE serves /sse and /messages/, Streamable HTTP serves /mcp
+            combined_routes = list(sse_app.routes) + list(streamable_app.routes)
+            combined_app = Starlette(routes=combined_routes)
+
+            # Copy state from both apps
+            for key, val in streamable_app.state._state.items():
+                combined_app.state._state[key] = val
+
+            safe_print(f"🚀 Starting dual-transport HTTP server on {base_uri}:{port}")
+            safe_print(f"   📡 Streamable HTTP: /mcp (Claude, Manus)")
+            safe_print(f"   📡 SSE: /sse (Poke, mcp-remote)")
+            if external_url:
+                safe_print(f"   External URL: {external_url}")
+
+            config = _uvicorn.Config(
+                combined_app,
+                host=host,
+                port=port,
+                log_level="info",
+                timeout_graceful_shutdown=0,
+            )
+            _server = _uvicorn.Server(config)
+            import anyio as _anyio
+            _anyio.run(_server.serve)
         else:
             server.run()
     except KeyboardInterrupt:
