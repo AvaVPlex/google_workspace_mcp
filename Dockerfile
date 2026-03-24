@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for faster dependency management
-RUN pip install --index-url https://pypi.yelpcorp.com/simple --no-cache-dir uv
+RUN pip install --no-cache-dir uv
 
 COPY . .
 
